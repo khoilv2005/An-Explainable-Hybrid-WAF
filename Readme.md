@@ -1,4 +1,4 @@
-# 🛡️ WAF - Web Application Firewall with Deep Learning
+# 🛡️ WebGuard: An Explainable Hybrid WAF using Attention-based CNN-BiLSTM for Evasive Attack Detection
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com)
@@ -6,7 +6,7 @@
 [![MySQL](https://img.shields.io/badge/MySQL-8.0-orange.svg)](https://mysql.com)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Hệ thống **Web Application Firewall (WAF)** kết hợp rule-based detection và **Deep Learning** để phát hiện các cuộc tấn công web. Sử dụng mô hình PyTorch với kiến trúc Attention và **LIME XAI** để giải thích các quyết định.
+**WebGuard** là hệ thống **Web Application Firewall (WAF)** kết hợp rule-based detection và **Deep Learning** (Attention-based CNN-BiLSTM) để phát hiện các cuộc tấn công web, bao gồm cả các tấn công evasive. Hệ thống tích hợp **LIME XAI** để giải thích các quyết định của model.
 
 ---
 
