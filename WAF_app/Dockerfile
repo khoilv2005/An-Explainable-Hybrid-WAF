@@ -38,5 +38,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/ || exit 1
 
-# Run the WAF application
-CMD ["python", "main.py"]
+# Run the WAF application with Uvicorn (4 workers)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "6", "--loop", "uvloop", "--no-access-log", "--backlog", "2048", "--limit-concurrency", "500"]

@@ -326,7 +326,7 @@ def import_rules():
                     action = 'BLOCK'
 
                 # Kiểm tra xem rule ID đã tồn tại chưa
-                existing_rule = session.query(Rule).get(rule_data.get('id'))
+                existing_rule = session.query(Rule).filter_by(id=rule_data.get('id')).first()
                 if existing_rule:
                     skipped_count += 1
                     continue # Bỏ qua nếu đã có
@@ -343,6 +343,7 @@ def import_rules():
                     action=action
                 )
                 session.add(new_rule)
+                session.flush()  # Flush để phát hiện lỗi duplicate ngay lập tức
                 added_count += 1
             
             session.commit()

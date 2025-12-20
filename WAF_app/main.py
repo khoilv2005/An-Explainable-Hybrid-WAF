@@ -1,135 +1,168 @@
 import sys
 import os
-import requests
 import re
 import json
 import ipaddress
+import asyncio
 from functools import lru_cache
-from contextlib import contextmanager
-from threading import Lock
-from flask import Flask, request, Response, render_template, jsonify
-from urllib.parse import urlparse
+from typing import Optional
+from contextlib import asynccontextmanager
 
-# Thêm thư mục gốc của dự án vào Python Path để có thể import từ 'shared'
+import httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Import các thành phần ORM từ file dùng chung
 try:
-    from shared.database import SessionLocal, Rule, IPBlacklist, ActivityLog, logger, init_database
+    from shared.database import Rule, IPBlacklist, ActivityLog, logger, init_database
+    from shared.models import Base
+    import shared.models  # Ensure models are loaded
 except ImportError:
-    print("FATAL ERROR: Could not import from 'shared/database.py'.")
-    print("Please ensure the file exists and the project structure is correct.")
+    print("FATAL ERROR: Could not import from 'shared/database.py' or 'shared/models.py'.")
     sys.exit(1)
 
-# Import decoder để lọc dữ liệu
 try:
     from decoder import deep_decode_data
 except ImportError:
     print("FATAL ERROR: Could not import from 'decoder.py'.")
-    print("Please ensure the decoder.py file exists in the WAF_app directory.")
     sys.exit(1)
 
-# Load configuration from environment variables
+try:
+    from ml_predictor import get_ml_predictor
+    ML_AVAILABLE = True
+except ImportError:
+    print("WARNING: ML predictor not available. WAF will run with rule-based detection only.")
+    ML_AVAILABLE = False
+
 from dotenv import load_dotenv
 load_dotenv()
 
-# --- Cấu hình ---
+# Configuration
 BACKEND_ADDRESS = os.getenv("WAF_BACKEND_ADDRESS", "http://127.0.0.1:80")
 LISTEN_HOST = os.getenv("WAF_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("WAF_LISTEN_PORT", "8080"))
+
+ML_ENABLED = os.getenv("WAF_ML_ENABLED", "true").lower() == "true"
+ML_CONFIDENCE_THRESHOLD = float(os.getenv("WAF_ML_CONFIDENCE_THRESHOLD", "0.7"))
+ML_LIME_ENABLED = os.getenv("WAF_ML_LIME_ENABLED", "true").lower() == "true"
 BLOCK_THRESHOLD = int(os.getenv("WAF_BLOCK_THRESHOLD", "100000"))
 
-app = Flask(__name__)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is not set")
 
-# --- Cache với thread-safe lock ---
-_cache_lock = Lock()
+# SQLAlchemy async setup
+async_engine = create_async_engine(
+    DATABASE_URL.replace("mysql+pymysql", "mysql+aiomysql"), 
+    echo=False, pool_size=20, max_overflow=0
+)
+AsyncSessionLocal = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+
+# Global caches
 WAF_RULES = []
-IP_BLACKLIST = set()
-_COMPILED_REGEX_CACHE = {}  # Cache cho compiled regex patterns
+IP_BLACKLIST = frozenset()
+_COMPILED_REGEX_CACHE = {}
 
+# ====== Lifecycle ======
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await init_db()
+    await load_cache_from_db()
+    logger.info(f"WAF Service (FastAPI/Async) is running on http://{LISTEN_HOST}:{LISTEN_PORT}")
+    yield
+    # Shutdown
+    await async_engine.dispose()
 
-# =============================================================================
-# TỐI ƯU 1: Context Manager cho Database Session
-# =============================================================================
-@contextmanager
-def get_db_session():
-    """Thread-safe database session context manager."""
-    session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+app = FastAPI(lifespan=lifespan)
 
+# ====== Database helpers ======
+async def init_db():
+    """Initialize database schema with retry logic"""
+    max_retries = 5
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("Database initialized")
+            return
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Database connection failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.error(f"Database initialization failed after {max_retries} attempts: {e}")
+                raise
 
-# =============================================================================
-# TỐI ƯU 2: Cache Compiled Regex Patterns
-# =============================================================================
 @lru_cache(maxsize=512)
 def get_compiled_regex(pattern: str):
-    """Cache compiled regex patterns để tránh compile lại mỗi request."""
+    """Cache compiled regex patterns"""
     return re.compile(pattern, re.IGNORECASE)
 
-
-# =============================================================================
-# TỐI ƯU 3: Cải thiện load_cache_from_db với thread-safe
-# =============================================================================
-def load_cache_from_db():
-    """Tải tất cả rule và IP blacklist từ DB vào cache trong bộ nhớ."""
+async def load_cache_from_db():
+    """Load rules and IP blacklist from DB into cache (async)"""
     global WAF_RULES, IP_BLACKLIST
     
-    with _cache_lock:
-        with get_db_session() as session:
-            try:
-                # Tải rules
-                rules_obj = session.query(Rule).filter_by(enabled=True).all()
-                new_rules = [r.to_dict() for r in rules_obj]
-                
-                # Pre-compile regex patterns cho các rules
-                for rule in new_rules:
-                    if rule.get('operator') in ('REGEX', 'REGEX_MATCH'):
-                        pattern = rule.get('value', '')
-                        if pattern:
-                            try:
-                                get_compiled_regex(pattern)  # Cache compiled pattern
-                            except re.error as e:
-                                logger.error(f"Invalid regex in rule {rule['id']}: {e}")
-                
-                WAF_RULES = new_rules
-                logger.info(f"Loaded {len(WAF_RULES)} active rules using ORM.")
-
-                # Tải IP blacklist
-                ips_list = session.query(IPBlacklist.ip_address).all()
-                IP_BLACKLIST = frozenset(ip[0] for ip in ips_list)  # frozenset cho lookup nhanh hơn
-                logger.info(f"Loaded {len(IP_BLACKLIST)} blacklisted IPs using ORM.")
-                
-            except Exception as e:
-                logger.error(f"Failed to load cache from database: {e}")
-
-
-def log_event_to_db(client_ip, method, path, status, action, rule_id=None):
-    """Ghi log vào DB bằng cách tạo một object ActivityLog."""
     try:
-        with get_db_session() as session:
+        async with AsyncSessionLocal() as session:
+            # Load rules
+            rules_query = select(Rule).where(Rule.enabled == True)
+            result = await session.execute(rules_query)
+            rules_obj = result.scalars().all()
+            new_rules = [r.to_dict() for r in rules_obj]
+            
+            for rule in new_rules:
+                if rule.get('operator') in ('REGEX', 'REGEX_MATCH'):
+                    pattern = rule.get('value', '')
+                    if pattern:
+                        try:
+                            get_compiled_regex(pattern)
+                        except re.error as e:
+                            logger.error(f"Invalid regex in rule {rule['id']}: {e}")
+            
+            WAF_RULES = new_rules
+            logger.info(f"Loaded {len(WAF_RULES)} active rules")
+            
+            # Load IP blacklist
+            ips_query = select(IPBlacklist.ip_address)
+            result = await session.execute(ips_query)
+            ips_list = result.scalars().all()
+            IP_BLACKLIST = frozenset(ips_list)
+            logger.info(f"Loaded {len(IP_BLACKLIST)} blacklisted IPs")
+            
+    except Exception as e:
+        logger.error(f"Failed to load cache from database: {e}")
+
+async def log_event_to_db(client_ip, method, path, status, action, rule_id=None):
+    """Log event to DB asynchronously"""
+    try:
+        async with AsyncSessionLocal() as session:
             new_log = ActivityLog(
                 client_ip=client_ip, request_method=method, request_path=path,
                 status_code=status, action_taken=action, triggered_rule_id=rule_id
             )
             session.add(new_log)
+            await session.commit()
     except Exception as e:
         logger.error(f"DB Log Failed: {e}")
 
-
-def add_ip_to_blacklist(ip, rule_id):
-    """Thêm một IP vào DB và cập nhật cache."""
+async def add_ip_to_blacklist(ip: str, rule_id: int):
+    """Add IP to blacklist asynchronously"""
     global IP_BLACKLIST
     
     try:
-        with get_db_session() as session:
-            existing_ip = session.query(IPBlacklist).filter_by(ip_address=ip).first()
+        async with AsyncSessionLocal() as session:
+            # Check if already exists
+            existing_query = select(IPBlacklist).where(IPBlacklist.ip_address == ip)
+            result = await session.execute(existing_query)
+            existing_ip = result.scalar()
+            
             if not existing_ip:
                 new_blacklist_entry = IPBlacklist(
                     ip_address=ip,
@@ -137,31 +170,81 @@ def add_ip_to_blacklist(ip, rule_id):
                     notes=f"Auto-blocked after reaching {BLOCK_THRESHOLD} violations."
                 )
                 session.add(new_blacklist_entry)
+                await session.commit()
                 logger.info(f"IP {ip} has been added to the blacklist.")
                 
-                # Cập nhật cache trực tiếp thay vì reload toàn bộ
-                with _cache_lock:
-                    IP_BLACKLIST = IP_BLACKLIST | {ip}
+                # Update cache
+                IP_BLACKLIST = IP_BLACKLIST | {ip}
                     
     except Exception as e:
         logger.error(f"Could not add IP {ip} to blacklist: {e}")
 
+async def check_and_auto_block(ip: str, rule_id: int):
+    """Check IP violation history and auto-block if needed"""
+    try:
+        async with AsyncSessionLocal() as session:
+            block_query = select(ActivityLog).where(
+                ActivityLog.client_ip == ip,
+                ActivityLog.action_taken == 'BLOCKED'
+            )
+            result = await session.execute(block_query)
+            block_count = len(result.scalars().all())
+            
+            logger.info(f"IP {ip} has {block_count} previous blocks. Threshold is {BLOCK_THRESHOLD}.")
+            
+            if block_count >= BLOCK_THRESHOLD - 1:
+                await add_ip_to_blacklist(ip, rule_id)
+    except Exception as e:
+        logger.error(f"Could not check auto-block status for IP {ip}: {e}")
 
-# =============================================================================
-# TỐI ƯU 4: Cải thiện Structured Data Parsing
-# =============================================================================
+# ====== Rule inspection ======
+def evaluate_operator(operator: str, value: str, target: str) -> bool:
+    """Evaluate operator for rule matching"""
+    try:
+        if operator == 'CONTAINS':
+            return value in target
+        if operator in ('REGEX', 'REGEX_MATCH'):
+            compiled = get_compiled_regex(value)
+            return bool(compiled.search(target))
+        if operator == '@eq':
+            return str(target) == str(value)
+        if operator == '@gt':
+            return float(target) > float(value)
+        if operator == '@lt':
+            return float(target) < float(value)
+        if operator == '@ipMatch':
+            return _check_ip_match(target, value)
+        logger.warning(f"Unknown operator: {operator}")
+        return False
+    except (ValueError, TypeError, re.error) as e:
+        logger.debug(f"Operator evaluation error for {operator}: {e}")
+        return False
+
+def _check_ip_match(target: str, value: str) -> bool:
+    """Helper for IP/CIDR matching"""
+    try:
+        target_ip = ipaddress.ip_address(str(target))
+        for val_ip in value.split(','):
+            val_ip = val_ip.strip()
+            if not val_ip:
+                continue
+            if '/' in val_ip:
+                if target_ip in ipaddress.ip_network(val_ip, strict=False):
+                    return True
+            elif target_ip == ipaddress.ip_address(val_ip):
+                return True
+        return False
+    except (ValueError, ipaddress.AddressValueError):
+        return False
+
 def parse_structured_data(data: str) -> list:
-    """Parse JSON/XML data to extract all values for inspection.
-    
-    Tối ưu: Kiểm tra nhanh trước khi parse để tránh overhead không cần thiết.
-    """
+    """Parse JSON/XML data"""
     if not data or len(data) < 2:
         return []
     
     parsed_values = []
     data_stripped = data.strip()
     
-    # Quick check cho JSON (bắt đầu bằng { hoặc [)
     if data_stripped.startswith(('{', '[')):
         try:
             json_obj = json.loads(data)
@@ -169,7 +252,6 @@ def parse_structured_data(data: str) -> list:
         except (json.JSONDecodeError, ValueError):
             pass
     
-    # Quick check cho XML (chứa < và >)
     if '<' in data and '>' in data:
         xml_tags = re.findall(r'<([^!/?][^>]*)>([^<]*)</\1>', data)
         for _, content in xml_tags:
@@ -179,13 +261,9 @@ def parse_structured_data(data: str) -> list:
     
     return parsed_values
 
-
 def _extract_values_from_dict(obj, _depth=0) -> list:
-    """Recursively extract all values from a nested dict/list structure.
-    
-    Tối ưu: Thêm depth limit để tránh stack overflow với nested data.
-    """
-    if _depth > 20:  # Giới hạn độ sâu đệ quy
+    """Recursively extract values from dict/list"""
+    if _depth > 20:
         return []
     
     values = []
@@ -208,100 +286,27 @@ def _extract_values_from_dict(obj, _depth=0) -> list:
     
     return values
 
-
-# =============================================================================
-# TỐI ƯU 5: Cải thiện evaluate_operator
-# =============================================================================
-def evaluate_operator(operator: str, value: str, target: str) -> bool:
-    """Evaluate different types of operators for rule matching.
+async def inspect_request_flask(req: Request) -> Optional[str]:
+    """Inspect request with WAF rules (async)"""
+    client_ip = req.client.host
     
-    Tối ưu: Sử dụng dict dispatch thay vì if-elif chain.
-    """
-    try:
-        if operator == 'CONTAINS':
-            return value in target
-        
-        if operator in ('REGEX', 'REGEX_MATCH'):
-            compiled = get_compiled_regex(value)
-            return bool(compiled.search(target))
-        
-        if operator == '@eq':
-            return str(target) == str(value)
-        
-        if operator == '@gt':
-            return float(target) > float(value)
-        
-        if operator == '@lt':
-            return float(target) < float(value)
-        
-        if operator == '@ipMatch':
-            return _check_ip_match(target, value)
-        
-        logger.warning(f"Unknown operator: {operator}")
-        return False
-        
-    except (ValueError, TypeError, re.error) as e:
-        logger.debug(f"Operator evaluation error for {operator}: {e}")
-        return False
-
-
-def _check_ip_match(target: str, value: str) -> bool:
-    """Helper function cho IP/CIDR matching."""
-    try:
-        target_ip = ipaddress.ip_address(str(target))
-        for val_ip in value.split(','):
-            val_ip = val_ip.strip()
-            if not val_ip:
-                continue
-            if '/' in val_ip:
-                if target_ip in ipaddress.ip_network(val_ip, strict=False):
-                    return True
-            elif target_ip == ipaddress.ip_address(val_ip):
-                return True
-        return False
-    except (ValueError, ipaddress.AddressValueError):
-        return False
-
-
-def check_and_auto_block(ip: str, rule_id: int):
-    """Kiểm tra lịch sử vi phạm của IP và tự động chặn nếu cần."""
-    try:
-        with get_db_session() as session:
-            block_count = session.query(ActivityLog).filter_by(
-                client_ip=ip, action_taken='BLOCKED'
-            ).count()
-            
-            logger.info(f"IP {ip} has {block_count} previous blocks. Threshold is {BLOCK_THRESHOLD}.")
-            
-            if block_count >= BLOCK_THRESHOLD - 1:
-                add_ip_to_blacklist(ip, rule_id)
-    except Exception as e:
-        logger.error(f"Could not check auto-block status for IP {ip}: {e}")
-
-
-
-
-# =============================================================================
-# TỐI ƯU 6: Cải thiện inspect_request_flask
-# =============================================================================
-def inspect_request_flask(req):
-    """Kiểm tra request với các rule WAF."""
-    client_ip = req.remote_addr
-    
-    # Quick check IP blacklist (O(1) lookup với frozenset)
     if client_ip in IP_BLACKLIST:
         return "IP_BLACKLIST"
 
-    # Lấy các phần của request một lần để tái sử dụng
-    request_body_str = req.get_data(as_text=True, cache=True)
-    query_string_str = req.query_string.decode('utf-8', 'ignore')
-    all_form_args = req.form.to_dict()
-    all_query_args = req.args.to_dict()
+    request_body_str = (await req.body()).decode('utf-8', 'ignore')
+    query_string_str = req.url.query or ""
     
-    # Cache các giá trị headers để tránh gọi nhiều lần
+    # Parse form data
+    try:
+        form_data = await req.form()
+        all_form_args = {k: v for k, v in form_data.items()}
+    except:
+        all_form_args = {}
+    
+    all_query_args = dict(req.query_params)
+    
     headers_values = None
     cookies_values = None
-    cookies_keys = None
     
     for rule in WAF_RULES:
         targets_to_check = set()
@@ -309,67 +314,30 @@ def inspect_request_flask(req):
 
         for target_part in rule_targets:
             if target_part in ('URL_PATH', 'REQUEST_URI'):
-                targets_to_check.add(req.path)
-                if req.path.startswith('/') and len(req.path) > 1:
-                    targets_to_check.add(req.path[1:])
-                    
+                targets_to_check.add(req.url.path)
             elif target_part == 'URL_QUERY':
                 targets_to_check.add(query_string_str)
-                
             elif target_part == 'HEADERS':
                 if headers_values is None:
                     headers_values = set(req.headers.values())
                 targets_to_check.update(headers_values)
-                
             elif target_part.startswith('HEADERS:'):
                 header_name = target_part.split(':', 1)[1]
                 header_val = req.headers.get(header_name, '')
                 if header_val:
                     targets_to_check.add(header_val)
-                    
             elif target_part == 'BODY':
                 targets_to_check.add(request_body_str)
-                
             elif target_part == 'ARGS':
                 targets_to_check.update(all_query_args.values())
                 targets_to_check.update(all_form_args.values())
-                
-            elif target_part == 'ARGS_NAMES':
-                targets_to_check.update(all_query_args.keys())
-                targets_to_check.update(all_form_args.keys())
-                
-            elif target_part == 'FILENAME':
-                if req.files:
-                    targets_to_check.update(f.filename for f in req.files.values() if f.filename)
-                    
             elif target_part == 'COOKIES':
                 if cookies_values is None:
                     cookies_values = set(req.cookies.values())
                 targets_to_check.update(cookies_values)
-                
-            elif target_part == 'COOKIES_NAMES':
-                if cookies_keys is None:
-                    cookies_keys = set(req.cookies.keys())
-                targets_to_check.update(cookies_keys)
-                
             elif target_part == 'REQUEST_METHOD':
                 targets_to_check.add(req.method.upper())
-                
-            elif target_part == 'REQUEST_PROTOCOL':
-                targets_to_check.add(req.environ.get('SERVER_PROTOCOL', 'HTTP/1.1'))
-                
-            elif target_part == 'FILES_CONTENT':
-                if req.files:
-                    for file in req.files.values():
-                        if file.filename:
-                            try:
-                                file_content = file.read(1024 * 1024)  # Giới hạn 1MB
-                                file.seek(0)
-                                targets_to_check.add(file_content.decode('utf-8', errors='ignore'))
-                            except Exception as e:
-                                logger.warning(f"Could not read file content for inspection: {e}")
 
-        # Bỏ các giá trị rỗng
         targets_to_check.discard('')
         targets_to_check.discard(None)
         
@@ -383,13 +351,7 @@ def inspect_request_flask(req):
         for item in targets_to_check:
             decoded_data, decode_log = deep_decode_data(str(item))
 
-            if len(decode_log) > 2:
-                logger.info(f"[DECODE] Rule {rule['id']}: '{item}' -> '{decoded_data}'")
-
-            # Prepare targets for inspection
             inspection_targets = [decoded_data]
-            
-            # Chỉ parse structured data nếu có nội dung
             if decoded_data:
                 parsed_values = parse_structured_data(decoded_data)
                 if parsed_values:
@@ -400,24 +362,82 @@ def inspect_request_flask(req):
                     if action == 'BLOCK':
                         logger.warning(
                             f"[MATCH][BLOCK] Rule {rule['id']} ('{rule['description']}') "
-                            f"triggered on: '{target}' (operator: {operator})"
+                            f"triggered on: '{target}'"
                         )
                         return f"RULE_ID: {rule['id']}"
-                    elif action in ('LOG', 'ALLOW'):
-                        logger.info(
-                            f"[MATCH][{action}] Rule {rule['id']} ('{rule['description']}') "
-                            f"matched on: '{target}' (operator: {operator}) - no blocking applied."
-                        )
-                        break
 
+    # ML Layer
+    if ML_AVAILABLE and ML_ENABLED:
+        ml_result = await check_with_ml(req)
+        if ml_result:
+            return ml_result
+    
     return None
 
+async def check_with_ml(req: Request) -> Optional[str]:
+    """ML-based detection (async)"""
+    try:
+        ml_predictor = get_ml_predictor()
+        
+        if not ml_predictor.is_loaded:
+            logger.info("[ML] Model not loaded, skipping ML check")
+            return None
+        
+        checks = []
+        
+        url_data = req.url.path or ""
+        if req.url.query:
+            url_data += "?" + req.url.query
+        if url_data and len(url_data.strip()) >= 3:
+            checks.append(("URL", url_data))
+        
+        if req.method in ['POST', 'PUT', 'PATCH']:
+            body_data = (await req.body()).decode('utf-8', 'ignore')
+            if body_data and len(body_data.strip()) >= 3:
+                checks.append(("BODY", body_data))
+        
+        for check_type, data in checks:
+            logger.info(f"[ML] Checking {check_type}: {data[:100]}...")
+            
+            result = ml_predictor.predict(data)
+            if len(result) == 3:
+                prediction, confidence, xai_patterns = result
+            else:
+                prediction, confidence = result
+                xai_patterns = {}
+            
+            if xai_patterns:
+                pattern_info = '; '.join([f"{cat}: {', '.join(pats[:3])}" for cat, pats in xai_patterns.items()])
+                logger.info(f"[ML][XAI] 🔍 [{check_type}] Detected patterns: {pattern_info}")
+            
+            logger.info(f"[ML] [{check_type}] Result: {prediction.upper()} | Confidence: {confidence:.4f}")
+            
+            if prediction == 'attack' and confidence >= ML_CONFIDENCE_THRESHOLD:
+                if ML_LIME_ENABLED:
+                    ml_predictor.log_explanation(data, num_samples=100)
+                
+                xai_info = f" | XAI: {list(xai_patterns.keys())}" if xai_patterns else ""
+                logger.warning(
+                    f"[ML][BLOCK] ⛔ Attack in {check_type}! "
+                    f"IP: {req.client.host} | Path: {req.url.path} | "
+                    f"Confidence: {confidence:.4f}{xai_info}"
+                )
+                return f"ML_DETECTION_{check_type}"
+            
+            if prediction == 'attack' and confidence < ML_CONFIDENCE_THRESHOLD:
+                logger.info(
+                    f"[ML][ALLOW] ⚠️ [{check_type}] Potential attack but below threshold. "
+                    f"Confidence: {confidence:.4f}"
+                )
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"[ML][ERROR] ML check failed: {e}")
+        return None
 
-# =============================================================================
-# TỐI ƯU 7: Cải thiện IP validation trong reset_db_management
-# =============================================================================
 def is_ip_allowed(client_ip: str, allowed_ips_str: str) -> bool:
-    """Kiểm tra IP có được phép hay không với hỗ trợ CIDR đúng cách."""
+    """Check if IP is allowed"""
     try:
         client_ip_obj = ipaddress.ip_address(client_ip)
     except ValueError:
@@ -429,11 +449,9 @@ def is_ip_allowed(client_ip: str, allowed_ips_str: str) -> bool:
             continue
         try:
             if '/' in allowed_ip:
-                # CIDR notation
                 if client_ip_obj in ipaddress.ip_network(allowed_ip, strict=False):
                     return True
             else:
-                # Single IP
                 if client_ip_obj == ipaddress.ip_address(allowed_ip):
                     return True
         except ValueError:
@@ -441,87 +459,95 @@ def is_ip_allowed(client_ip: str, allowed_ips_str: str) -> bool:
     
     return False
 
-
-# --- Routes ---
-@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
-@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-def reverse_proxy(path):
-    block_reason = inspect_request_flask(request)
+# ====== Routes ======
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"])
+async def reverse_proxy(request: Request, path: str):
+    """Main WAF reverse proxy (async)"""
+    block_reason = await inspect_request_flask(request)
+    
     if block_reason:
-        logger.warning(f"Denied request from IP {request.remote_addr}. Reason: {block_reason}")
-        
-        rule_id = None
-        if 'RULE_ID' in block_reason:
-            match = re.search(r'\d+', block_reason)
-            if match:
-                try:
-                    rule_id = int(match.group())
-                except ValueError:
-                    pass
-        
-        log_event_to_db(request.remote_addr, request.method, request.full_path, 403, 'BLOCKED', rule_id)
-        if rule_id:
-            check_and_auto_block(request.remote_addr, rule_id)
-        
-        return render_template('error_403.html'), 403
-
-            
-    try:
-        headers = {key: value for (key, value) in request.headers if key.lower() != 'host'}
-        headers['Host'] = urlparse(BACKEND_ADDRESS).netloc
-        backend_url = f'{BACKEND_ADDRESS}/{path}'
-        if request.query_string:
-            backend_url += '?' + request.query_string.decode('utf-8')
-            
-        resp = requests.request(
-            method=request.method,
-            url=backend_url,
-            headers=headers,
-            data=request.get_data(),
-            cookies=request.cookies,
-            allow_redirects=False,
-            timeout=10
+        logger.warning(f"Denied request from IP {request.client.host}. Reason: {block_reason}")
+        await log_event_to_db(request.client.host, request.method, str(request.url), 403, 'BLOCKED')
+        return Response(
+            content="<html><body><h1>403 Forbidden</h1></body></html>", 
+            status_code=403, 
+            media_type="text/html"
         )
-            
-        log_event_to_db(request.remote_addr, request.method, request.full_path, resp.status_code, 'ALLOWED')
+    
+    try:
+        # Prepare headers
+        headers = dict(request.headers)
+        headers.pop('host', None)
         
-        excluded_headers = frozenset(['content-encoding', 'content-length', 'transfer-encoding', 'connection'])
-        resp_headers = [(name, value) for (name, value) in resp.raw.headers.items() 
-                        if name.lower() not in excluded_headers]
+        # Build backend URL
+        backend_url = f"{BACKEND_ADDRESS}/{path}"
+        if request.url.query:
+            backend_url += f"?{request.url.query}"
         
-        return Response(resp.content, resp.status_code, resp_headers)
+        # Read request body
+        body = await request.body() if request.method in ['POST', 'PUT', 'PATCH'] else None
         
-    except requests.exceptions.RequestException as e:
+        # Async HTTP client
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.request(
+                method=request.method,
+                url=backend_url,
+                headers=headers,
+                content=body,
+                cookies=request.cookies,
+                follow_redirects=False
+            )
+        
+        await log_event_to_db(request.client.host, request.method, str(request.url), resp.status_code, 'ALLOWED')
+        
+        # Copy headers but remove Content-Length to avoid mismatch
+        response_headers = dict(resp.headers)
+        response_headers.pop('content-length', None)
+        
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=response_headers,
+            media_type=resp.headers.get('content-type')
+        )
+        
+    except httpx.RequestError as e:
         logger.error(f"Could not connect to backend: {e}")
-        log_event_to_db(request.remote_addr, request.method, request.full_path, 502, 'ERROR')
-        return render_template('error_502.html'), 502
+        await log_event_to_db(request.client.host, request.method, str(request.url), 502, 'ERROR')
+        return Response(
+            content="<html><body><h1>502 Bad Gateway</h1></body></html>", 
+            status_code=502, 
+            media_type="text/html"
+        )
 
-
-@app.route('/reset-db-management', methods=['POST'])
-def reset_db_management():
+@app.post("/reset-db-management")
+async def reset_db_management(request: Request):
+    """Reset cache endpoint (async)"""
     allowed_ips = os.getenv("ADMIN_ALLOWED_IPS", "127.0.0.1,192.168.232.1,::1")
-    client_ip = request.remote_addr
+    client_ip = request.client.host
 
     if not is_ip_allowed(client_ip, allowed_ips):
         logger.warning(f"Unauthorized attempt to reset cache from IP: {client_ip}")
-        return jsonify({"status": "error", "message": "Forbidden"}), 403
+        return JSONResponse({"status": "error", "message": "Forbidden"}, status_code=403)
     
     try:
         logger.info("Received API command to reload cache from Admin Panel...")
-        load_cache_from_db()
+        await load_cache_from_db()
         logger.info("Cache reloaded successfully via API.")
-        return jsonify({"status": "success", "message": "Cache reloaded."})
+        return JSONResponse({"status": "success", "message": "Cache reloaded."})
     except Exception as e:
         logger.error(f"Failed to reload cache via API: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+@app.get("/")
+async def health():
+    """Health check"""
+    return Response(
+        content="<html><body>WAF (FastAPI/Async) is running</body></html>", 
+        status_code=200, 
+        media_type="text/html"
+    )
 
-# --- Main ---
 if __name__ == "__main__":
-    if not init_database():
-        logger.error("Failed to initialize database. Exiting...")
-        sys.exit(1)
-
-    load_cache_from_db()
-    logger.info(f"WAF Service is running on http://{LISTEN_HOST}:{LISTEN_PORT}")
-    app.run(host=LISTEN_HOST, port=LISTEN_PORT)
+    import uvicorn
+    uvicorn.run(app, host=LISTEN_HOST, port=LISTEN_PORT, workers=4)

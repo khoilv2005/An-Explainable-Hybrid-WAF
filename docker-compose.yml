@@ -22,7 +22,7 @@ services:
 #     timeout: 20s
 #     retries: 10
 
-  # WAF Application
+  # WAF Application - Optimized for Ryzen 9 7945HX (16C/32T)
   waf_app:
     build:
       context: .
@@ -33,12 +33,27 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: ${DATABASE_URL}
-      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_LEVEL: ${LOG_LEVEL:-WARNING}
       WAF_LISTEN_HOST: ${WAF_LISTEN_HOST}
       WAF_LISTEN_PORT: ${WAF_LISTEN_PORT}
       WAF_BACKEND_ADDRESS: ${WAF_BACKEND_ADDRESS}
       WAF_BLOCK_THRESHOLD: ${WAF_BLOCK_THRESHOLD}
+      WAF_ML_ENABLED: ${WAF_ML_ENABLED:-false}
+      WAF_ML_CONFIDENCE_THRESHOLD: ${WAF_ML_CONFIDENCE_THRESHOLD:-0.5}
+      WAF_ML_LIME_ENABLED: ${WAF_ML_LIME_ENABLED:-false}
+      # Force ONNX inference and set ONNX model path in container
+      ML_FORCE_ONNX: "true"
+      ML_MODEL_ONNX_PATH: "/app/models/waf_model.onnx"
+      ML_TOKENIZER_JSON_PATH: "/app/models/tokenizer_word_index.json"
       ADMIN_ALLOWED_IPS: ${ADMIN_ALLOWED_IPS}
+      # ONNX/MKL threading - single thread per worker to avoid contention
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      ONNXRUNTIME_INTRA_OP_NUM_THREADS: "1"
+      ONNXRUNTIME_INTER_OP_NUM_THREADS: "1"
+      # Python optimizations
+      PYTHONOPTIMIZE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
     ports:
       - "8080:8080"
     depends_on:
@@ -46,7 +61,16 @@ services:
     networks:
       - waf_network
     volumes:
-      - ./logs:/app/logs
+      - ./WAF_app/models:/app/models
+    # Resource limits for Docker Desktop (6 CPUs available)
+    deploy:
+      resources:
+        limits:
+          cpus: '5'
+          memory: 6G
+        reservations:
+          cpus: '3'
+          memory: 2G
     healthcheck:
       test: ["CMD", "pgrep", "-f", "python main.py"]
       interval: 30s
@@ -75,8 +99,7 @@ services:
       - waf_app
     networks:
       - waf_network
-    volumes:
-      - ./logs:/app/logs
+
     healthcheck:
       test: ["CMD", "pgrep", "-f", "python main.py"]
       interval: 30s
