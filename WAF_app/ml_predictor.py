@@ -64,7 +64,8 @@ DANGEROUS_PATTERNS = {
     'SQL': [
         'select', 'union', 'drop', 'insert', 'delete', 'update', 'exec', 'execute',
         'waitfor', 'sleep', 'benchmark', 'information_schema', 'xp_cmdshell',
-        "' or ", '" or ', 'or 1=1', 'or 0=0', "'--", '"--', '1=1'
+        "' or ", '" or ', 'or 1=1', 'or 0=0', "'--", '"--', '1=1', '1 = 1',
+        "or '1'='1", 'or "1"="1"', ' or 1', "' or '", '" or "', '= 1 --'
     ],
     'XSS': [
         '<script', '</script', 'javascript:', 'onerror=', 'onload=', 'onclick=',
@@ -325,30 +326,40 @@ class MLPredictor:
             return ""
     
     def _predict_proba_for_lime(self, texts):
-        """Wrapper for LIME explainer - returns probabilities"""
+        """
+        Wrapper for LIME explainer - returns raw logits for better weight differentiation
+        
+        Note: Using raw logits instead of sigmoid probabilities because
+        sigmoid saturates at extreme values (0.99+), making perturbation
+        effects too small for meaningful LIME weights.
+        
+        IMPORTANT: Process texts in batch (not loop) to match explain.py behavior
+        """
+        # Batch tokenization (like explain.py)
+        sequences = self.tokenizer.texts_to_sequences(texts)
+        padded = self._pad_sequences(sequences, maxlen=MAX_LEN, padding='post', truncating='post')
+        
+        if self.use_onnx and self.onnx_session:
+            inputs = np.asarray(padded, dtype=np.int64)
+            logits = self.onnx_session.run(None, {self.onnx_session.get_inputs()[0].name: inputs})[0]
+            # logits shape: (batch_size, 1)
+        else:
+            torch = get_torch()
+            DEVICE = get_device()
+            tensor = torch.LongTensor(padded).to(DEVICE)
+            with torch.no_grad():
+                logits = self.model(tensor).cpu().numpy()
+        
+        # Convert to [p_normal, p_attack] format (like explain.py)
         results = []
-        for text in texts:
-            sequences = self.tokenizer.texts_to_sequences([text])
-            padded = self._pad_sequences(sequences, maxlen=MAX_LEN, padding='post', truncating='post')
-
-            if self.use_onnx and self.onnx_session:
-                inputs = np.asarray(padded, dtype=np.int64)
-                logits = self.onnx_session.run(None, {self.onnx_session.get_inputs()[0].name: inputs})[0]
-                attack_prob = float(1 / (1 + np.exp(-logits[0][0])))
-            else:
-                torch = get_torch()
-                DEVICE = get_device()
-                tensor = torch.LongTensor(padded).to(DEVICE)
-                with torch.no_grad():
-                    logits = self.model(tensor)
-                    attack_prob = torch.sigmoid(logits).cpu().numpy()[0][0]
-
-            normal_prob = 1 - attack_prob
-            results.append([normal_prob, attack_prob])
+        for p in logits:
+            p_attack = float(p[0])  # Raw logit
+            p_normal = 1 - p_attack
+            results.append([p_normal, p_attack])
 
         return np.array(results)
     
-    def explain(self, request_data: str, num_samples: int = 200) -> dict:
+    def explain(self, request_data: str, num_samples: int = 500) -> dict:
         """
         Generate LIME explanation for prediction
         
@@ -365,7 +376,7 @@ class MLPredictor:
         try:
             from lime.lime_text import LimeTextExplainer
             
-            # Create character-level explainer
+            # Create character-level explainer (matches model tokenization)
             explainer = LimeTextExplainer(
                 class_names=["Normal", "Attack"],
                 char_level=True,
@@ -373,17 +384,33 @@ class MLPredictor:
                 bow=False
             )
             
-            # Get explanation
+            # Get explanation - explain ALL unique characters (no limit)
             exp = explainer.explain_instance(
                 request_data,
                 self._predict_proba_for_lime,
-                num_features=min(len(set(request_data)), 20),
+                num_features=len(set(request_data)),  # All unique chars
                 num_samples=num_samples
             )
             
-            # Get probabilities
-            probs = self._predict_proba_for_lime([request_data])[0]
-            p_normal, p_attack = probs
+            # Get actual probabilities for display (using sigmoid)
+            # Note: _predict_proba_for_lime returns raw logits for better LIME weights
+            # but we need sigmoid probabilities for display
+            sequences = self.tokenizer.texts_to_sequences([request_data])
+            padded = self._pad_sequences(sequences, maxlen=MAX_LEN, padding='post', truncating='post')
+            
+            if self.use_onnx and self.onnx_session:
+                inputs = np.asarray(padded, dtype=np.int64)
+                logits = self.onnx_session.run(None, {self.onnx_session.get_inputs()[0].name: inputs})[0]
+                p_attack = float(1 / (1 + np.exp(-logits[0][0])))  # Sigmoid for display
+            else:
+                torch = get_torch()
+                DEVICE = get_device()
+                tensor = torch.LongTensor(padded).to(DEVICE)
+                with torch.no_grad():
+                    logits = self.model(tensor)
+                    p_attack = float(torch.sigmoid(logits).cpu().numpy()[0][0])  # Sigmoid for display
+            
+            p_normal = 1 - p_attack
             
             # Get character weights
             char_weights = {}
@@ -393,12 +420,25 @@ class MLPredictor:
                 else:
                     char_weights[char] = weight
             
-            # Sort by importance
+            # Sort by importance (absolute weight)
             sorted_chars = sorted(char_weights.items(), key=lambda x: abs(x[1]), reverse=True)
             
-            # Get top dangerous (positive weight) and safe (negative weight)
-            top_dangerous = [(c, w) for c, w in sorted_chars if w > 0][:5]
-            top_safe = [(c, w) for c, w in sorted_chars if w < 0][:5]
+            # Get top dangerous (positive weight) and safe (negative weight) - increased to 10
+            top_dangerous = [(c, w) for c, w in sorted_chars if w > 0][:10]
+            top_safe = [(c, w) for c, w in sorted_chars if w < 0][:10]
+            
+            # N-gram analysis (3-grams) for better interpretability
+            ngram_weights = []
+            n = 3
+            for i in range(len(request_data) - n + 1):
+                ngram = request_data[i:i+n]
+                weight = sum(char_weights.get(c, 0) for c in ngram)
+                ngram_weights.append((ngram, weight))
+            
+            # Sort n-grams by absolute weight
+            sorted_ngrams = sorted(ngram_weights, key=lambda x: abs(x[1]), reverse=True)
+            top_dangerous_ngrams = [(ng, w) for ng, w in sorted_ngrams if w > 0][:5]
+            top_safe_ngrams = [(ng, w) for ng, w in sorted_ngrams if w < 0][:5]
             
             return {
                 'payload': request_data[:100],
@@ -408,6 +448,8 @@ class MLPredictor:
                 'confidence': max(p_normal, p_attack),
                 'top_dangerous': top_dangerous,
                 'top_safe': top_safe,
+                'top_dangerous_ngrams': top_dangerous_ngrams,
+                'top_safe_ngrams': top_safe_ngrams,
                 'all_weights': char_weights
             }
             

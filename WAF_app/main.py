@@ -532,26 +532,38 @@ async def explain_request(request: Request):
         if not ml_predictor.is_loaded:
             return JSONResponse({"status": "error", "message": "ML model not loaded"}, status_code=503)
         
-        logger.info(f"[XAI] Generating LIME explanation for: {payload[:100]}...")
+        # URL decode payload first for proper analysis
+        from urllib.parse import unquote_plus
+        decoded_payload = unquote_plus(payload)
         
-        # Generate LIME explanation
-        explanation = ml_predictor.explain(payload, num_samples=num_samples)
+        logger.info(f"[XAI] Generating LIME explanation for: {decoded_payload[:100]}...")
+        
+        # Generate LIME explanation on DECODED payload
+        explanation = ml_predictor.explain(decoded_payload, num_samples=num_samples)
         
         if explanation is None:
             return JSONResponse({"status": "error", "message": "Failed to generate explanation"}, status_code=500)
         
         logger.info(f"[XAI] Explanation generated - Prediction: {explanation['prediction']}, Confidence: {explanation['confidence']:.2f}")
         
+        # Detect patterns for word-level explanation (Option 1)
+        from ml_predictor import detect_patterns
+        detected_patterns = detect_patterns(decoded_payload)
+        
         return JSONResponse({
             "status": "success",
             "explanation": {
                 "payload": explanation["payload"],
+                "full_payload": decoded_payload,  # Decoded payload for highlighting
                 "prediction": explanation["prediction"],
                 "p_normal": round(explanation["p_normal"] * 100, 2),
                 "p_attack": round(explanation["p_attack"] * 100, 2),
                 "confidence": round(explanation["confidence"] * 100, 2),
                 "top_dangerous": [{"char": c, "weight": round(w, 4)} for c, w in explanation["top_dangerous"]],
-                "top_safe": [{"char": c, "weight": round(w, 4)} for c, w in explanation["top_safe"]]
+                "top_safe": [{"char": c, "weight": round(w, 4)} for c, w in explanation["top_safe"]],
+                "top_dangerous_ngrams": [{"ngram": ng, "weight": round(w, 4)} for ng, w in explanation.get("top_dangerous_ngrams", [])],
+                "top_safe_ngrams": [{"ngram": ng, "weight": round(w, 4)} for ng, w in explanation.get("top_safe_ngrams", [])],
+                "detected_patterns": detected_patterns  # Word-level patterns
             }
         })
         
