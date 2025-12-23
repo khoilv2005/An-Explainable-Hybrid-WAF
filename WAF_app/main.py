@@ -150,7 +150,21 @@ async def log_event_to_db(client_ip, method, path, status, action, rule_id=None)
             session.add(new_log)
             await session.commit()
     except Exception as e:
-        logger.error(f"DB Log Failed: {e}")
+        # Handle foreign key constraint error - rule may not exist in DB yet
+        if "foreign key constraint" in str(e).lower() or "1452" in str(e):
+            logger.warning(f"Rule ID {rule_id} not found in DB, logging without rule reference")
+            try:
+                async with AsyncSessionLocal() as session:
+                    new_log = ActivityLog(
+                        client_ip=client_ip, request_method=method, request_path=path,
+                        status_code=status, action_taken=action, triggered_rule_id=None
+                    )
+                    session.add(new_log)
+                    await session.commit()
+            except Exception as e2:
+                logger.error(f"DB Log Failed (retry): {e2}")
+        else:
+            logger.error(f"DB Log Failed: {e}")
 
 async def add_ip_to_blacklist(ip: str, rule_id: int):
     """Add IP to blacklist asynchronously"""
@@ -460,6 +474,95 @@ def is_ip_allowed(client_ip: str, allowed_ips_str: str) -> bool:
     return False
 
 # ====== Routes ======
+# NOTE: Specific routes MUST be defined BEFORE the catch-all route
+
+@app.post("/reset-db-management")
+async def reset_db_management(request: Request):
+    """Reset cache endpoint (async)"""
+    allowed_ips = os.getenv("ADMIN_ALLOWED_IPS", "127.0.0.1,192.168.232.1,::1")
+    client_ip = request.client.host
+
+    if not is_ip_allowed(client_ip, allowed_ips):
+        logger.warning(f"Unauthorized attempt to reset cache from IP: {client_ip}")
+        return JSONResponse({"status": "error", "message": "Forbidden"}, status_code=403)
+    
+    try:
+        logger.info("Received API command to reload cache from Admin Panel...")
+        await load_cache_from_db()
+        logger.info("Cache reloaded successfully via API.")
+        return JSONResponse({"status": "success", "message": "Cache reloaded."})
+    except Exception as e:
+        logger.error(f"Failed to reload cache via API: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.get("/health")
+async def health():
+    """Health check"""
+    return Response(
+        content="<html><body>WAF (FastAPI/Async) is running</body></html>", 
+        status_code=200, 
+        media_type="text/html"
+    )
+
+@app.post("/api/explain")
+async def explain_request(request: Request):
+    """
+    On-demand XAI explanation endpoint.
+    Generates LIME explanation for a given request payload.
+    """
+    allowed_ips = os.getenv("ADMIN_ALLOWED_IPS", "127.0.0.1,192.168.232.1,::1,172.18.0.0/16")
+    client_ip = request.client.host
+
+    if not is_ip_allowed(client_ip, allowed_ips):
+        logger.warning(f"Unauthorized XAI request from IP: {client_ip}")
+        return JSONResponse({"status": "error", "message": "Forbidden"}, status_code=403)
+    
+    try:
+        body = await request.json()
+        payload = body.get("payload", "")
+        num_samples = body.get("num_samples", 200)
+        
+        if not payload:
+            return JSONResponse({"status": "error", "message": "No payload provided"}, status_code=400)
+        
+        if not ML_AVAILABLE:
+            return JSONResponse({"status": "error", "message": "ML not available"}, status_code=503)
+        
+        ml_predictor = get_ml_predictor()
+        if not ml_predictor.is_loaded:
+            return JSONResponse({"status": "error", "message": "ML model not loaded"}, status_code=503)
+        
+        logger.info(f"[XAI] Generating LIME explanation for: {payload[:100]}...")
+        
+        # Generate LIME explanation
+        explanation = ml_predictor.explain(payload, num_samples=num_samples)
+        
+        if explanation is None:
+            return JSONResponse({"status": "error", "message": "Failed to generate explanation"}, status_code=500)
+        
+        logger.info(f"[XAI] Explanation generated - Prediction: {explanation['prediction']}, Confidence: {explanation['confidence']:.2f}")
+        
+        return JSONResponse({
+            "status": "success",
+            "explanation": {
+                "payload": explanation["payload"],
+                "prediction": explanation["prediction"],
+                "p_normal": round(explanation["p_normal"] * 100, 2),
+                "p_attack": round(explanation["p_attack"] * 100, 2),
+                "confidence": round(explanation["confidence"] * 100, 2),
+                "top_dangerous": [{"char": c, "weight": round(w, 4)} for c, w in explanation["top_dangerous"]],
+                "top_safe": [{"char": c, "weight": round(w, 4)} for c, w in explanation["top_safe"]]
+            }
+        })
+        
+    except json.JSONDecodeError:
+        return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
+    except Exception as e:
+        logger.error(f"[XAI] Error: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+# Catch-all route for reverse proxy - MUST be last
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"])
 async def reverse_proxy(request: Request, path: str):
     """Main WAF reverse proxy (async)"""
@@ -467,7 +570,24 @@ async def reverse_proxy(request: Request, path: str):
     
     if block_reason:
         logger.warning(f"Denied request from IP {request.client.host}. Reason: {block_reason}")
-        await log_event_to_db(request.client.host, request.method, str(request.url), 403, 'BLOCKED')
+        
+        # Parse rule_id and determine action type
+        rule_id = None
+        action = 'BLOCKED'
+        
+        if block_reason.startswith("RULE_ID:"):
+            # Rule-based block
+            try:
+                rule_id = int(block_reason.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif block_reason.startswith("ML_DETECTION"):
+            # ML-based block
+            action = 'ML_BLOCKED'
+        elif block_reason == "IP_BLACKLIST":
+            action = 'IP_BLOCKED'
+        
+        await log_event_to_db(request.client.host, request.method, str(request.url), 403, action, rule_id=rule_id)
         return Response(
             content="<html><body><h1>403 Forbidden</h1></body></html>", 
             status_code=403, 
@@ -500,15 +620,16 @@ async def reverse_proxy(request: Request, path: str):
         
         await log_event_to_db(request.client.host, request.method, str(request.url), resp.status_code, 'ALLOWED')
         
-        # Copy headers but remove Content-Length to avoid mismatch
+        # Copy headers but remove problematic headers to avoid mismatch
         response_headers = dict(resp.headers)
         response_headers.pop('content-length', None)
+        response_headers.pop('content-encoding', None)
+        response_headers.pop('transfer-encoding', None)
         
         return Response(
             content=resp.content,
             status_code=resp.status_code,
-            headers=response_headers,
-            media_type=resp.headers.get('content-type')
+            headers=response_headers
         )
         
     except httpx.RequestError as e:
@@ -519,34 +640,6 @@ async def reverse_proxy(request: Request, path: str):
             status_code=502, 
             media_type="text/html"
         )
-
-@app.post("/reset-db-management")
-async def reset_db_management(request: Request):
-    """Reset cache endpoint (async)"""
-    allowed_ips = os.getenv("ADMIN_ALLOWED_IPS", "127.0.0.1,192.168.232.1,::1")
-    client_ip = request.client.host
-
-    if not is_ip_allowed(client_ip, allowed_ips):
-        logger.warning(f"Unauthorized attempt to reset cache from IP: {client_ip}")
-        return JSONResponse({"status": "error", "message": "Forbidden"}, status_code=403)
-    
-    try:
-        logger.info("Received API command to reload cache from Admin Panel...")
-        await load_cache_from_db()
-        logger.info("Cache reloaded successfully via API.")
-        return JSONResponse({"status": "success", "message": "Cache reloaded."})
-    except Exception as e:
-        logger.error(f"Failed to reload cache via API: {e}")
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-
-@app.get("/")
-async def health():
-    """Health check"""
-    return Response(
-        content="<html><body>WAF (FastAPI/Async) is running</body></html>", 
-        status_code=200, 
-        media_type="text/html"
-    )
 
 if __name__ == "__main__":
     import uvicorn

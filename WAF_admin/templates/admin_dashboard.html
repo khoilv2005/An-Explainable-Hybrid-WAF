@@ -1,13 +1,32 @@
 <!DOCTYPE html>
 <html lang="vi">
+
 <head>
     <meta charset="UTF-8">
     <title>WAF Dashboard</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; background-color: #f8f9fa; color: #212529; }
-        .container { max-width: 1400px; margin: 2em auto; padding: 2em; background-color: #fff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.05); }
-        h1, h2 { border-bottom: 2px solid #dee2e6; padding-bottom: 0.5em; }
-        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            margin: 0;
+            background-color: #f8f9fa;
+            color: #212529;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 2em auto;
+            padding: 2em;
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05);
+        }
+
+        h1,
+        h2 {
+            border-bottom: 2px solid #dee2e6;
+            padding-bottom: 0.5em;
+        }
+
         /* --- CSS CHO KHU VỰC THỐNG KÊ --- */
         .stats-grid {
             display: grid;
@@ -15,35 +34,254 @@
             gap: 1.5em;
             margin-bottom: 3em;
         }
+
         .stat-card {
             background-color: #fff;
             padding: 1.5em;
             border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
             text-align: center;
         }
+
         .stat-card .value {
             font-size: 2.5em;
             font-weight: bold;
             margin: 0.2em 0;
         }
+
         .stat-card .label {
             font-size: 1em;
             color: #6c757d;
         }
+
         .stat-card:hover {
             transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
         }
+
         /* --- KẾT THÚC CSS THỐNG KÊ --- */
 
-        table { width: 100%; border-collapse: collapse; margin-top: 1em; }
-        th, td { padding: 0.75em; text-align: left; border-bottom: 1px solid #dee2e6; font-size: 14px; }
-        thead { background-color: #e9ecef; }
-        tr:nth-child(even) { background-color: #f8f9fa; }
-        .status-blocked { color: #dc3545; font-weight: bold; }
-        .status-allowed { color: #28a745; }
-        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1em;
+        }
+
+        th,
+        td {
+            padding: 0.75em;
+            text-align: left;
+            border-bottom: 1px solid #dee2e6;
+            font-size: 14px;
+        }
+
+        thead {
+            background-color: #e9ecef;
+        }
+
+        tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+
+        .status-blocked {
+            color: #dc3545;
+            font-weight: bold;
+        }
+
+        .status-allowed {
+            color: #28a745;
+        }
+
+        .status-ml_blocked {
+            color: #6f42c1;
+            font-weight: bold;
+        }
+
+        .status-ip_blocked {
+            color: #fd7e14;
+            font-weight: bold;
+        }
+
+        /* XAI Button */
+        .xai-btn {
+            background: linear-gradient(135deg, #6f42c1, #e83e8c);
+            color: white;
+            border: none;
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.3s ease;
+        }
+
+        .xai-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 2px 8px rgba(111, 66, 193, 0.4);
+        }
+
+        .xai-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* XAI Modal */
+        .xai-modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(4px);
+        }
+
+        .xai-modal-content {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            margin: 5% auto;
+            padding: 30px;
+            border-radius: 16px;
+            width: 90%;
+            max-width: 700px;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            animation: modalSlideIn 0.3s ease;
+        }
+
+        @keyframes modalSlideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-50px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .xai-close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: color 0.2s;
+        }
+
+        .xai-close:hover {
+            color: #fff;
+        }
+
+        .xai-header {
+            text-align: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .xai-header h2 {
+            margin: 0;
+            color: #e83e8c;
+            font-size: 1.5em;
+        }
+
+        .xai-payload {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 15px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 13px;
+            word-break: break-all;
+            margin-bottom: 20px;
+            border-left: 4px solid #6f42c1;
+        }
+
+        .xai-prediction {
+            display: flex;
+            justify-content: space-around;
+            margin-bottom: 20px;
+        }
+
+        .xai-pred-box {
+            text-align: center;
+            padding: 15px 25px;
+            border-radius: 12px;
+            min-width: 120px;
+        }
+
+        .xai-pred-attack {
+            background: linear-gradient(135deg, #dc3545, #c82333);
+        }
+
+        .xai-pred-normal {
+            background: linear-gradient(135deg, #28a745, #1e7e34);
+        }
+
+        .xai-pred-value {
+            font-size: 2em;
+            font-weight: bold;
+        }
+
+        .xai-tokens {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .xai-token-section h4 {
+            margin: 0 0 10px 0;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .xai-token-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 12px;
+            margin: 5px 0;
+            border-radius: 6px;
+            font-family: monospace;
+        }
+
+        .xai-token-dangerous {
+            background: rgba(220, 53, 69, 0.2);
+            border-left: 3px solid #dc3545;
+        }
+
+        .xai-token-safe {
+            background: rgba(40, 167, 69, 0.2);
+            border-left: 3px solid #28a745;
+        }
+
+        .xai-loading {
+            text-align: center;
+            padding: 40px;
+        }
+
+        .xai-loading-spinner {
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top: 4px solid #e83e8c;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
         /* Category stats styles */
         .category-stats {
             display: flex;
@@ -51,6 +289,7 @@
             gap: 1em;
             margin-bottom: 2em;
         }
+
         .category-item {
             display: flex;
             align-items: center;
@@ -60,6 +299,7 @@
             border-radius: 8px;
             border: 1px solid #dee2e6;
         }
+
         .category-badge {
             display: inline-block;
             padding: 0.25em 0.6em;
@@ -72,41 +312,93 @@
             vertical-align: baseline;
             border-radius: 0.375rem;
         }
+
         .category-count {
             font-weight: 500;
             color: #495057;
         }
-        .category-sql-injection { background-color: #dc3545; }
-        .category-nosql-injection { background-color: #ff6b35; }
-        .category-xss { background-color: #fd7e14; }
-        .category-bot-protection { background-color: #20c997; }
-        .category-path-traversal { background-color: #6f42c1; }
-        .category-command-injection { background-color: #e83e8c; }
-        .category-file-upload { background-color: #17a2b8; }
-        .category-rate-limiting { background-color: #28a745; }
-        .category-custom { background-color: #6c757d; }
-        .category-injection { background-color: #e83e8c; }
+
+        .category-sql-injection {
+            background-color: #dc3545;
+        }
+
+        .category-nosql-injection {
+            background-color: #ff6b35;
+        }
+
+        .category-xss {
+            background-color: #fd7e14;
+        }
+
+        .category-bot-protection {
+            background-color: #20c997;
+        }
+
+        .category-path-traversal {
+            background-color: #6f42c1;
+        }
+
+        .category-command-injection {
+            background-color: #e83e8c;
+        }
+
+        .category-file-upload {
+            background-color: #17a2b8;
+        }
+
+        .category-rate-limiting {
+            background-color: #28a745;
+        }
+
+        .category-custom {
+            background-color: #6c757d;
+        }
+
+        .category-injection {
+            background-color: #e83e8c;
+        }
+
         /* New categories */
-        .category-scanner-bot { background-color: #20c997; }              /* tương tự Bot Protection */
-        .category-protocol-manipulation { background-color: #007bff; }    /* xanh dương */
-        .category-ssti { background-color: #6f42c1; }                     /* tím */
-        .category-lfi-rce { background-color: #343a40; }                  /* xám đậm */
+        .category-scanner-bot {
+            background-color: #20c997;
+        }
+
+        /* tương tự Bot Protection */
+        .category-protocol-manipulation {
+            background-color: #007bff;
+        }
+
+        /* xanh dương */
+        .category-ssti {
+            background-color: #6f42c1;
+        }
+
+        /* tím */
+        .category-lfi-rce {
+            background-color: #343a40;
+        }
+
+        /* xám đậm */
     </style>
 </head>
+
 <body>
     <div class="container">
         <h1>WAF Dashboard</h1>
 
         <div class="stats-grid">
-            <div class="stat-card" onclick="resetFilter()" style="cursor: pointer; transition: all 0.3s ease;" title="Show all requests">
+            <div class="stat-card" onclick="resetFilter()" style="cursor: pointer; transition: all 0.3s ease;"
+                title="Show all requests">
                 <div class="value">{{ stats.total_requests }}</div>
                 <div class="label">📊 Tổng số Requests</div>
             </div>
-            <div class="stat-card" onclick="filterByAction('ALLOWED')" style="cursor: pointer; transition: all 0.3s ease;" title="Show allowed requests only">
+            <div class="stat-card" onclick="filterByAction('ALLOWED')"
+                style="cursor: pointer; transition: all 0.3s ease;" title="Show allowed requests only">
                 <div class="value" style="color: #28a745;">{{ stats.allowed_requests }}</div>
                 <div class="label">✅ Requests Được Phép</div>
             </div>
-            <div class="stat-card" onclick="filterByAction('BLOCKED')" style="cursor: pointer; transition: all 0.3s ease;" title="Show blocked requests only">
+            <div class="stat-card" onclick="filterByAction('BLOCKED')"
+                style="cursor: pointer; transition: all 0.3s ease;" title="Show blocked requests only">
                 <div class="value" style="color: #dc3545;">{{ stats.blocked_requests }}</div>
                 <div class="label">🚫 Requests Bị Chặn</div>
             </div>
@@ -116,7 +408,8 @@
                     <div class="label">🛡️ Rule Đang Hoạt Động</div>
                 </div>
             </a>
-            <a href="{{ url_for('view_blacklist') }}" class="stat-card" style="text-decoration: none; color: inherit; display: block;">
+            <a href="{{ url_for('view_blacklist') }}" class="stat-card"
+                style="text-decoration: none; color: inherit; display: block;">
                 <div class="value" style="color: #6c757d;">{{ stats.blacklisted_ips }}</div>
                 <div class="label">⛔ IP Trong Blacklist</div>
             </a>
@@ -126,7 +419,8 @@
         <div class="category-stats">
             {% for category_stat in stats.category_stats %}
             <div class="category-item">
-                <span class="category-badge category-{{ category_stat.category.lower().replace(' ', '-').replace('/', '-') }}">
+                <span
+                    class="category-badge category-{{ category_stat.category.lower().replace(' ', '-').replace('/', '-') }}">
                     {{ category_stat.category }}
                 </span>
                 <span class="category-count">{{ category_stat.count }} rules</span>
@@ -156,23 +450,180 @@
                     <td style="word-break: break-all;">{{ log.request_path | e }}</td>
                     <td>
                         <span class="status-{{ log.action_taken.lower() }}">
-                            {{ log.action_taken | e }}
+                            {% if log.action_taken == 'ML_BLOCKED' %}DL_BLOCKED{% else %}{{ log.action_taken | e }}{%
+                            endif %}
                         </span>
                     </td>
                     <td>{{ log.status_code | e }}</td>
-                    <td>{{ (log.triggered_rule_id if log.triggered_rule_id is not none else 'N/A') | e }}</td>
+                    <td>
+                        {% if log.triggered_rule_id is not none %}
+                        {{ log.triggered_rule_id }}
+                        {% elif log.action_taken == 'ML_BLOCKED' %}
+                        <span style="color: #6f42c1; font-weight: bold;">🧠 DL</span>
+                        <button class="xai-btn" onclick="showXAI('{{ log.request_path | e }}')"
+                            title="View LIME XAI Explanation">🔍 XAI</button>
+                        {% elif log.action_taken == 'IP_BLOCKED' %}
+                        <span style="color: #dc3545; font-weight: bold;">⛔ IP</span>
+                        {% else %}
+                        N/A
+                        {% endif %}
+                    </td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
 
+    <!-- XAI Modal -->
+    <div id="xaiModal" class="xai-modal">
+        <div class="xai-modal-content">
+            <span class="xai-close" onclick="closeXAI()">&times;</span>
+            <div id="xaiContent">
+                <!-- Content will be loaded here -->
+            </div>
+        </div>
+    </div>
+
+
     <script>
+        // ====== XAI Modal Functions ======
+        function showXAI(requestPath) {
+            const modal = document.getElementById('xaiModal');
+            const content = document.getElementById('xaiContent');
+
+            // Show loading state
+            content.innerHTML = `
+                <div class="xai-loading">
+                    <div class="xai-loading-spinner"></div>
+                    <p>Generating LIME XAI Explanation...</p>
+                    <p style="font-size: 12px; color: #aaa;">This may take a few seconds</p>
+                </div>
+            `;
+            modal.style.display = 'block';
+
+            // Extract payload from request path (after ?)
+            let payload = requestPath;
+            if (requestPath.includes('?')) {
+                payload = requestPath.split('?').slice(1).join('?');
+            }
+
+            // Call XAI API
+            fetch('/api/explain', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ payload: payload, num_samples: 200 })
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        renderXAI(data.explanation, requestPath);
+                    } else {
+                        content.innerHTML = `
+                        <div class="xai-header">
+                            <h2>❌ Error</h2>
+                        </div>
+                        <p style="text-align: center; color: #dc3545;">${escapeHtml(data.message || 'Failed to generate explanation')}</p>
+                    `;
+                    }
+                })
+                .catch(error => {
+                    content.innerHTML = `
+                    <div class="xai-header">
+                        <h2>❌ Connection Error</h2>
+                    </div>
+                    <p style="text-align: center; color: #dc3545;">${escapeHtml(error.message)}</p>
+                `;
+                });
+        }
+
+        function closeXAI() {
+            document.getElementById('xaiModal').style.display = 'none';
+        }
+
+        function renderXAI(exp, fullPath) {
+            const content = document.getElementById('xaiContent');
+
+            let dangerousTokensHtml = '';
+            if (exp.top_dangerous && exp.top_dangerous.length > 0) {
+                dangerousTokensHtml = exp.top_dangerous.map(t => `
+                    <div class="xai-token-item xai-token-dangerous">
+                        <span>'${escapeHtml(t.char)}'</span>
+                        <span style="color: #dc3545;">+${t.weight.toFixed(4)}</span>
+                    </div>
+                `).join('');
+            } else {
+                dangerousTokensHtml = '<p style="color: #aaa;">No dangerous tokens detected</p>';
+            }
+
+            let safeTokensHtml = '';
+            if (exp.top_safe && exp.top_safe.length > 0) {
+                safeTokensHtml = exp.top_safe.map(t => `
+                    <div class="xai-token-item xai-token-safe">
+                        <span>'${escapeHtml(t.char)}'</span>
+                        <span style="color: #28a745;">${t.weight.toFixed(4)}</span>
+                    </div>
+                `).join('');
+            } else {
+                safeTokensHtml = '<p style="color: #aaa;">No safe tokens detected</p>';
+            }
+
+            content.innerHTML = `
+                <div class="xai-header">
+                    <h2>🔍 LIME XAI Explanation</h2>
+                    <p style="color: #aaa; margin-top: 10px;">Character-level analysis of ML prediction</p>
+                </div>
+                
+                <div class="xai-payload">
+                    <strong>📝 Request:</strong><br>
+                    ${escapeHtml(fullPath.substring(0, 200))}${fullPath.length > 200 ? '...' : ''}
+                </div>
+                
+                <div class="xai-prediction">
+                    <div class="xai-pred-box xai-pred-normal">
+                        <div class="xai-pred-value">${exp.p_normal}%</div>
+                        <div>🟢 Normal</div>
+                    </div>
+                    <div class="xai-pred-box xai-pred-attack">
+                        <div class="xai-pred-value">${exp.p_attack}%</div>
+                        <div>🔴 Attack</div>
+                    </div>
+                </div>
+                
+                <div style="text-align: center; margin-bottom: 20px;">
+                    <span style="font-size: 1.2em; font-weight: bold;">
+                        ${exp.prediction === 'Attack' ? '⚠️ ATTACK DETECTED' : '✅ NORMAL'}
+                    </span>
+                    <span style="color: #aaa;"> (Confidence: ${exp.confidence}%)</span>
+                </div>
+                
+                <div class="xai-tokens">
+                    <div class="xai-token-section">
+                        <h4>💀 Dangerous Tokens</h4>
+                        ${dangerousTokensHtml}
+                    </div>
+                    <div class="xai-token-section">
+                        <h4>🛡️ Safe Tokens</h4>
+                        ${safeTokensHtml}
+                    </div>
+                </div>
+            `;
+        }
+
+        // Close modal when clicking outside
+        window.onclick = function (event) {
+            const modal = document.getElementById('xaiModal');
+            if (event.target === modal) {
+                closeXAI();
+            }
+        }
+
+        // ====== Existing Functions ======
         // Store existing log IDs to track what's new
         let existingLogIds = new Set();
         let currentPage = 1;
         let paginationData = {};
         let currentFilter = 'ALL'; // ALL, ALLOWED, or BLOCKED
+
 
         // Generate unique log ID from log data
         function getLogId(log) {
@@ -323,6 +774,22 @@
                 .replace(/'/g, "&#039;");
         }
 
+        // Get triggered rule display based on action type
+        function getTriggeredRuleDisplay(log) {
+            if (log.triggered_rule_id !== null && log.triggered_rule_id !== undefined) {
+                return escapeHtml(log.triggered_rule_id);
+            }
+            if (log.action_taken === 'ML_BLOCKED') {
+                // Include XAI button for ML blocked requests
+                const escapedPath = escapeHtml(log.request_path).replace(/'/g, "\\'");
+                return `<span style="color: #6f42c1; font-weight: bold;">🧠 DL</span> <button class="xai-btn" onclick="showXAI('${escapedPath}')" title="View LIME XAI Explanation">🔍 XAI</button>`;
+            }
+            if (log.action_taken === 'IP_BLOCKED') {
+                return '<span style="color: #dc3545; font-weight: bold;">⛔ IP</span>';
+            }
+            return 'N/A';
+        }
+
         function updateLogTable(newLogs) {
             const tbody = document.querySelector('table tbody');
             if (tbody && newLogs && newLogs.length > 0) {
@@ -342,11 +809,11 @@
                         <td style="word-break: break-all;">${escapeHtml(log.request_path)}</td>
                         <td>
                             <span class="status-${log.action_taken.toLowerCase()}">
-                                ${escapeHtml(log.action_taken)}
+                                ${log.action_taken === 'ML_BLOCKED' ? 'DL_BLOCKED' : escapeHtml(log.action_taken)}
                             </span>
                         </td>
                         <td>${escapeHtml(log.status_code)}</td>
-                        <td>${escapeHtml(log.triggered_rule_id || 'N/A')}</td>
+                        <td>${getTriggeredRuleDisplay(log)}</td>
                     `;
 
                     // Just track new logs without highlighting
@@ -377,7 +844,7 @@
         }
 
         // Add visual indicator
-        document.addEventListener('DOMContentLoaded', function() {
+        document.addEventListener('DOMContentLoaded', function () {
             const header = document.querySelector('h1');
             if (header) {
                 const statusIndicator = document.createElement('span');
@@ -424,4 +891,5 @@
         });
     </script>
 </body>
+
 </html>

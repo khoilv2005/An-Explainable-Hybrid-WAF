@@ -21,6 +21,7 @@ load_dotenv()
 
 # --- Cấu hình ---
 WAF_RESET_URL = os.getenv("WAF_RESET_URL", "http://127.0.0.1:8080/reset-db-management")
+WAF_API_URL = os.getenv("WAF_API_URL", "http://waf_app:8080")  # WAF container URL
 LISTEN_HOST = os.getenv("ADMIN_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("ADMIN_LISTEN_PORT", "5000"))
 
@@ -38,7 +39,40 @@ def notify_waf_to_reset():
     except requests.exceptions.RequestException as e:
         print(f"[ERROR][Admin] Could not connect to WAF to send reset command: {e}")
 
-# --- Các Route ---
+# --- API Routes ---
+
+@app.route('/api/explain', methods=['POST'])
+def api_explain():
+    """
+    Proxy endpoint to get LIME XAI explanation from WAF.
+    Forwards request to WAF's /api/explain endpoint.
+    """
+    try:
+        data = request.get_json()
+        if not data or 'payload' not in data:
+            return jsonify({'status': 'error', 'message': 'No payload provided'}), 400
+        
+        # Forward to WAF
+        waf_url = f"{WAF_API_URL}/api/explain"
+        response = requests.post(
+            waf_url,
+            json=data,
+            timeout=30  # LIME can take time
+        )
+        
+        return jsonify(response.json()), response.status_code
+        
+    except requests.exceptions.Timeout:
+        return jsonify({'status': 'error', 'message': 'XAI request timed out (LIME is slow)'}), 504
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to get XAI explanation: {e}")
+        return jsonify({'status': 'error', 'message': f'Failed to connect to WAF: {str(e)}'}), 502
+    except Exception as e:
+        logger.error(f"XAI API error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# --- Page Routes ---
+
 
 # Route cho Dashboard Chính
 @app.route('/')
@@ -46,7 +80,7 @@ def admin_dashboard():
     session = SessionLocal()
     try:
         total_requests = session.query(ActivityLog).count()
-        blocked_requests = session.query(ActivityLog).filter(ActivityLog.action_taken.in_(['BLOCKED', 'ERROR'])).count()
+        blocked_requests = session.query(ActivityLog).filter(ActivityLog.action_taken.in_(['BLOCKED', 'ML_BLOCKED', 'IP_BLOCKED', 'ERROR'])).count()
         allowed_requests = session.query(ActivityLog).filter_by(action_taken='ALLOWED').count()
         active_rules = session.query(Rule).filter_by(enabled=True).count()
         blacklisted_ips = session.query(IPBlacklist).count()
@@ -100,8 +134,8 @@ def api_logs_latest():
             base_query = base_query.filter(ActivityLog.action_taken == 'ALLOWED')
             logger.info(f"Applied filter: {action_filter}")
         elif action_filter == 'BLOCKED':
-            base_query = base_query.filter(ActivityLog.action_taken.in_(['BLOCKED', 'ERROR']))
-            logger.info(f"Applied filter: {action_filter} (includes BLOCKED and ERROR)")
+            base_query = base_query.filter(ActivityLog.action_taken.in_(['BLOCKED', 'ML_BLOCKED', 'IP_BLOCKED', 'ERROR']))
+            logger.info(f"Applied filter: {action_filter} (includes BLOCKED, ML_BLOCKED, IP_BLOCKED and ERROR)")
 
         # Get total count for pagination (with filter applied)
         total_logs = base_query.count()
@@ -123,7 +157,7 @@ def api_logs_latest():
 
         # Get current statistics
         all_total_requests = session.query(ActivityLog).count()
-        all_blocked_requests = session.query(ActivityLog).filter(ActivityLog.action_taken.in_(['BLOCKED', 'ERROR'])).count()
+        all_blocked_requests = session.query(ActivityLog).filter(ActivityLog.action_taken.in_(['BLOCKED', 'ML_BLOCKED', 'IP_BLOCKED', 'ERROR'])).count()
         all_allowed_requests = session.query(ActivityLog).filter_by(action_taken='ALLOWED').count()
         active_rules = session.query(Rule).filter_by(enabled=True).count()
         blacklisted_ips = session.query(IPBlacklist).count()
